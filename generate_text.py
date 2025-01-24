@@ -118,7 +118,8 @@ class TextTransformer(nn.Module):
         return output
 
 
-def train(model, dataloader, criterion, optimizer, device, num_epochs):
+def train(model, dataloader, criterion, optimizer, scheduler,
+          device, num_epochs):
     model.train()
     for epoch in range(num_epochs):
         epoch_loss = 0
@@ -134,8 +135,16 @@ def train(model, dataloader, criterion, optimizer, device, num_epochs):
             optimizer.step()
             epoch_loss += loss.item()
 
+        if isinstance(scheduler,
+                      torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(epoch_loss/len(dataloader))
+        else:
+            scheduler.step()
         epoch_loss /= len(dataloader)
-        print(f"Epoch: {epoch+1}, Loss: {epoch_loss:.4f}")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch: {epoch+1}/{num_epochs}, " +
+              f"Loss: {epoch_loss/len(dataloader):.4f}, " +
+              f"LR: {current_lr:.6f}")
     print("Training finished!")
 
 
@@ -162,6 +171,9 @@ def generate_text(model, tokenizer, device, max_seq_length=128, start_text=""):
                                    next_token_id.unsqueeze(0)), dim=1)
             if next_token_id.item() == tokenizer.eos_token_id:
                 break
+            if len(input_ids[0]) >= max_seq_length:
+                break
+
         generated_ids = input_ids.squeeze().tolist()
 
         generated_text = tokenizer.decode(generated_ids,
@@ -176,11 +188,11 @@ if __name__ == "__main__":
                         type=str, default="",
                         help="Text to start generation from.")
     parser.add_argument("--batch_size",
-                        type=int, default=32, help="Batch size.")
+                        type=int, default=16, help="Batch size.")
     parser.add_argument("--embed_dim",
-                        type=int, default=256, help="Embedding dimension.")
+                        type=int, default=16, help="Embedding dimension.")
     parser.add_argument("--hidden_dim",
-                        type=int, default=512, help="Hidden dimension.")
+                        type=int, default=16, help="Hidden dimension.")
     parser.add_argument("--n_head",
                         type=int, default=4, help="Number of attention heads.")
     parser.add_argument("--n_layers",
@@ -189,13 +201,16 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate",
                         type=float, default=0.001, help="Learning rate.")
     parser.add_argument("--num_epochs",
-                        type=int, default=50,
+                        type=int, default=100,
                         help="Number of training epochs.")
     parser.add_argument("--max_seq_length",
-                        type=int, default=128, help="Maximum sequence length.")
+                        type=int, default=32, help="Maximum sequence length.")
     parser.add_argument("--model_name",
                         type=str, default="bert-base-uncased",
                         help="Name of the pretrained tokenizer model.")
+    parser.add_argument("--weight_decay", type=float,
+                        default=0.01,
+                        help="Gradient clipping norm.")
 
     args = parser.parse_args()
 
@@ -210,6 +225,7 @@ if __name__ == "__main__":
     NUM_EPOCHS = args.num_epochs
     MAX_SEQ_LENGTH = args.max_seq_length
     MODEL_NAME = args.model_name
+    WEIGHT_DECAY = args.weight_decay
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
@@ -241,9 +257,13 @@ if __name__ == "__main__":
     ).to(device)
 
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE,
+                            weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', patience=5, factor=0.5)
 
-    train(model, dataloader, criterion, optimizer, device, NUM_EPOCHS)
+    train(model, dataloader, criterion, optimizer,
+          scheduler, device, NUM_EPOCHS)
 
     generated_text = generate_text(
         model, tokenizer, device, MAX_SEQ_LENGTH, start_text
