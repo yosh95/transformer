@@ -6,8 +6,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import Transformer
 import argparse
-
 from transformers import AutoTokenizer
+
 
 PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
@@ -16,12 +16,21 @@ EOS_TOKEN = "<eos>"
 
 
 def load_text(file_path):
-    with open(file_path, "r", encoding="utf-8") as file:
-        text = file.read()
-    return text
+    """Loads text from a file with error handling."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            text = file.read()
+        return text
+    except FileNotFoundError:
+        print(f"Error: File not found at {file_path}")
+        exit(1)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        exit(1)
 
 
 def prepare_data(tokenizer, text, max_seq_length):
+    """Prepares the data for the model."""
     tokens = tokenizer.tokenize(text)
     data = []
     for i in range(0, len(tokens) - max_seq_length, 1):
@@ -37,6 +46,7 @@ def prepare_data(tokenizer, text, max_seq_length):
 
 
 class TextDataset(Dataset):
+    """Dataset for the text data."""
 
     def __init__(self, data, pad_token_id, max_seq_length):
         self.data = data
@@ -50,28 +60,32 @@ class TextDataset(Dataset):
         input_ids, target_ids = self.data[idx]
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         target_ids = torch.tensor(target_ids, dtype=torch.long)
+
         if len(input_ids) < self.max_seq_length:
             pad_len = self.max_seq_length - len(input_ids)
             input_ids = torch.cat(
-                            [input_ids, torch.full((pad_len,),
-                                                   self.pad_token_id)])
+                [input_ids, torch.full((pad_len,), self.pad_token_id)]
+            )
             target_ids = torch.cat(
-                            [target_ids, torch.full((pad_len,),
-                                                    self.pad_token_id)])
+                [target_ids, torch.full((pad_len,), self.pad_token_id)]
+            )
         return input_ids, target_ids
 
 
-def create_dataloader(data, pad_token_id, batch_size, max_seq_length):
+def create_dataloader(data, pad_token_id, batch_size, max_seq_length,
+                      shuffle=True):
+    """Creates a DataLoader for the dataset."""
     dataset = TextDataset(data, pad_token_id, max_seq_length)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
     return dataloader
 
 
 class PositionalEncoding(nn.Module):
+    """Positional Encoding module."""
 
     def __init__(self, embed_dim, max_seq_length):
         super().__init__()
-        self.encoding = torch.zeros(max_seq_length, embed_dim)
+        encoding = torch.zeros(max_seq_length, embed_dim)
         position = torch.arange(0,
                                 max_seq_length,
                                 dtype=torch.float).unsqueeze(1)
@@ -79,16 +93,18 @@ class PositionalEncoding(nn.Module):
             torch.arange(0, embed_dim, 2).float() *
             (-torch.log(torch.tensor(10000.0)) / embed_dim)
         )
-        self.encoding[:, 0::2] = torch.sin(position * div_term)
-        self.encoding[:, 1::2] = torch.cos(position * div_term)
-        self.encoding = self.encoding.unsqueeze(0)
-        self.register_buffer("positional_encoding", self.encoding)
+        encoding[:, 0::2] = torch.sin(position * div_term)
+        encoding[:, 1::2] = torch.cos(position * div_term)
+        encoding = encoding.unsqueeze(0)
+        self.register_buffer("positional_encoding", encoding)
 
     def forward(self, x):
-        return x + self.positional_encoding[:, : x.size(1), :]
+        """Apply positional encodings."""
+        return x + self.positional_encoding[:, :x.size(1), :]
 
 
 class TextTransformer(nn.Module):
+    """Text Transformer model."""
 
     def __init__(self,
                  vocab_size,
@@ -100,75 +116,89 @@ class TextTransformer(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.positional_encoding = PositionalEncoding(
-                        embed_dim, max_seq_length)
+            embed_dim, max_seq_length)
         self.transformer = Transformer(
             embed_dim, n_head, n_layers, hidden_dim, batch_first=True
         )
         self.fc = nn.Linear(embed_dim, vocab_size)
 
     def forward(self, src, tgt):
+        """Forward pass of the transformer model."""
         src = self.embedding(src) * torch.sqrt(
-                        torch.tensor(src.size(-1), dtype=torch.float))
+            torch.tensor(src.size(-1), dtype=torch.float))
         src = self.positional_encoding(src)
         tgt = self.embedding(tgt) * torch.sqrt(
-                        torch.tensor(tgt.size(-1), dtype=torch.float))
+            torch.tensor(tgt.size(-1), dtype=torch.float))
         tgt = self.positional_encoding(tgt)
         output = self.transformer(src, tgt)
         output = self.fc(output)
         return output
 
 
-def train(model, dataloader, criterion, optimizer, scheduler,
-          device, num_epochs):
+def train_epoch(model, dataloader, criterion, optimizer,
+                device, clip_norm=1.0):
+    """Trains the model for one epoch."""
     model.train()
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        for src_batch, tgt_batch in dataloader:
-            src_batch = src_batch.to(device)
-            tgt_batch = tgt_batch.to(device)
-            optimizer.zero_grad()
+    epoch_loss = 0
+    for src_batch, tgt_batch in dataloader:
+        src_batch = src_batch.to(device)
+        tgt_batch = tgt_batch.to(device)
+        optimizer.zero_grad()
 
-            output = model(src_batch[:, :-1], tgt_batch[:, :-1])
-            loss = criterion(output.reshape(-1, output.size(-1)),
-                             tgt_batch[:, 1:].reshape(-1))
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
+        output = model(src_batch[:, :-1], tgt_batch[:, :-1])
+        loss = criterion(output.reshape(-1, output.size(-1)),
+                         tgt_batch[:, 1:].reshape(-1))
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    return epoch_loss / len(dataloader)
+
+
+def train(model, train_dataloader, criterion, optimizer,
+          scheduler, device, num_epochs, clip_norm):
+    """Trains the model."""
+    for epoch in range(num_epochs):
+        train_loss = train_epoch(model, train_dataloader, criterion,
+                                 optimizer, device, clip_norm)
 
         if isinstance(scheduler,
                       torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(epoch_loss/len(dataloader))
+            scheduler.step(train_loss)
         else:
             scheduler.step()
-        epoch_loss /= len(dataloader)
+
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch: {epoch+1}/{num_epochs}, " +
-              f"Loss: {epoch_loss/len(dataloader):.4f}, " +
+              f"Train Loss: {train_loss:.4f}, " +
               f"LR: {current_lr:.6f}")
+
     print("Training finished!")
 
 
 def generate_text(model, tokenizer, device, max_seq_length=128, start_text=""):
+    """Generates text from the model."""
     model.eval()
+    tokens = tokenizer.tokenize(start_text)
+
+    if tokenizer.bos_token is None:
+        bos_token = BOS_TOKEN
+    else:
+        bos_token = tokenizer.bos_token
+
+    input_ids = tokenizer.convert_tokens_to_ids(
+        [bos_token] + tokens)
+    input_ids = torch.tensor(input_ids,
+                             dtype=torch.long).unsqueeze(0).to(device)
+
     with torch.no_grad():
-        tokens = tokenizer.tokenize(start_text)
-
-        if tokenizer.bos_token is None:
-            bos_token = BOS_TOKEN
-        else:
-            bos_token = tokenizer.bos_token
-
-        input_ids = tokenizer.convert_tokens_to_ids(
-                        [bos_token] + tokens)
-        input_ids = torch.tensor(input_ids,
-                                 dtype=torch.long).unsqueeze(0).to(device)
-
         for _ in range(max_seq_length):
             output = model(input_ids[:, :-1], input_ids)
             next_token_id = torch.argmax(output[:, -1, :], dim=-1)
 
             input_ids = torch.cat((input_ids,
-                                   next_token_id.unsqueeze(0)), dim=1)
+                                  next_token_id.unsqueeze(0)), dim=1)
             if next_token_id.item() == tokenizer.eos_token_id:
                 break
             if len(input_ids[0]) >= max_seq_length:
@@ -176,12 +206,18 @@ def generate_text(model, tokenizer, device, max_seq_length=128, start_text=""):
 
         generated_ids = input_ids.squeeze().tolist()
 
-        generated_text = tokenizer.decode(generated_ids,
-                                          skip_special_tokens=True)
+    generated_text = tokenizer.decode(generated_ids,
+                                      skip_special_tokens=True)
     return generated_text.strip()
 
 
-if __name__ == "__main__":
+def load_model(model, model_path, device):
+    """Loads the model from the given path."""
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    return model
+
+
+def main():
     parser = argparse.ArgumentParser(description="Train a Transformer model.")
     parser.add_argument("text_file", type=str, help="Path to the text file.")
     parser.add_argument("--start_text",
@@ -210,7 +246,14 @@ if __name__ == "__main__":
                         help="Name of the pretrained tokenizer model.")
     parser.add_argument("--weight_decay", type=float,
                         default=0.01,
+                        help="Weight decay.")
+    parser.add_argument("--clip_norm", type=float,
+                        default=1.0,
                         help="Gradient clipping norm.")
+    parser.add_argument("--train_val_split", type=float, default=0.8,
+                        help="Proportion of data to use for training")
+    parser.add_argument("--load_model", type=str, default=None,
+                        help="Path to load a pretrained model")
 
     args = parser.parse_args()
 
@@ -226,6 +269,9 @@ if __name__ == "__main__":
     MAX_SEQ_LENGTH = args.max_seq_length
     MODEL_NAME = args.model_name
     WEIGHT_DECAY = args.weight_decay
+    CLIP_NORM = args.clip_norm
+    TRAIN_VAL_SPLIT = args.train_val_split
+    LOAD_MODEL_PATH = args.load_model
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
@@ -238,15 +284,19 @@ if __name__ == "__main__":
     if tokenizer.eos_token is None:
         tokenizer.add_special_tokens({'eos_token': EOS_TOKEN})
 
-    # if tokenizer.bos_token is None:
-    #     tokenizer.add_special_tokens({'bos_token': BOS_TOKEN})
-
     text = load_text(file_path)
     data = prepare_data(tokenizer, text, MAX_SEQ_LENGTH)
-    dataloader = create_dataloader(data,
-                                   tokenizer.pad_token_id,
-                                   BATCH_SIZE,
-                                   MAX_SEQ_LENGTH)
+
+    # Split data into training and validation sets
+    split_idx = int(len(data) * TRAIN_VAL_SPLIT)
+    train_data = data[:split_idx]
+
+    train_dataloader = create_dataloader(train_data,
+                                         tokenizer.pad_token_id,
+                                         BATCH_SIZE,
+                                         MAX_SEQ_LENGTH,
+                                         shuffle=True)
+
     vocab_size = len(tokenizer)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -256,16 +306,24 @@ if __name__ == "__main__":
         vocab_size, EMBED_DIM, HIDDEN_DIM, N_HEAD, N_LAYERS, MAX_SEQ_LENGTH
     ).to(device)
 
+    if LOAD_MODEL_PATH:
+        model = load_model(model, LOAD_MODEL_PATH, device)
+        print(f"Model loaded from {LOAD_MODEL_PATH}")
+
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE,
                             weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 'min', patience=5, factor=0.5)
 
-    train(model, dataloader, criterion, optimizer,
-          scheduler, device, NUM_EPOCHS)
+    train(model, train_dataloader, criterion, optimizer,
+          scheduler, device, NUM_EPOCHS, CLIP_NORM)
 
     generated_text = generate_text(
         model, tokenizer, device, MAX_SEQ_LENGTH, start_text
     )
     print(f"Generated Text based on '{start_text}': {generated_text}")
+
+
+if __name__ == "__main__":
+    main()
