@@ -226,9 +226,9 @@ def main():
     parser.add_argument("--batch_size",
                         type=int, default=16, help="Batch size.")
     parser.add_argument("--embed_dim",
-                        type=int, default=16, help="Embedding dimension.")
+                        type=int, default=32, help="Embedding dimension.")
     parser.add_argument("--hidden_dim",
-                        type=int, default=16, help="Hidden dimension.")
+                        type=int, default=32, help="Hidden dimension.")
     parser.add_argument("--n_head",
                         type=int, default=4, help="Number of attention heads.")
     parser.add_argument("--n_layers",
