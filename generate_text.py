@@ -4,9 +4,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.nn import Transformer
 import argparse
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModel
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.nn import TransformerDecoder, TransformerDecoderLayer
 
 
 PAD_TOKEN = "<pad>"
@@ -104,34 +105,43 @@ class PositionalEncoding(nn.Module):
 
 
 class TextTransformer(nn.Module):
-    """Text Transformer model."""
+    """Text Transformer model (Encoder-Decoder)."""
 
-    def __init__(self,
-                 vocab_size,
-                 embed_dim,
-                 hidden_dim,
-                 n_head,
-                 n_layers,
-                 max_seq_length):
+    def __init__(self, model_name, vocab_size, max_seq_length, n_head,
+                 n_layers, hidden_dim):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.pretrained_model = AutoModel.from_pretrained(model_name)
+        embed_dim = self.pretrained_model.config.hidden_size
+        self.embedding = self.pretrained_model.embeddings.word_embeddings
         self.positional_encoding = PositionalEncoding(
             embed_dim, max_seq_length)
-        self.transformer = Transformer(
-            embed_dim, n_head, n_layers, hidden_dim, batch_first=True
-        )
+
+        encoder_layers = TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_head, dim_feedforward=hidden_dim)
+        self.transformer_encoder = TransformerEncoder(
+            encoder_layers, num_layers=n_layers)
+
+        decoder_layers = TransformerDecoderLayer(
+            d_model=embed_dim, nhead=n_head, dim_feedforward=hidden_dim)
+        self.transformer_decoder = TransformerDecoder(
+            decoder_layers, num_layers=n_layers)
+
         self.fc = nn.Linear(embed_dim, vocab_size)
 
     def forward(self, src, tgt):
-        """Forward pass of the transformer model."""
         src = self.embedding(src) * torch.sqrt(
             torch.tensor(src.size(-1), dtype=torch.float))
         src = self.positional_encoding(src)
         tgt = self.embedding(tgt) * torch.sqrt(
             torch.tensor(tgt.size(-1), dtype=torch.float))
         tgt = self.positional_encoding(tgt)
-        output = self.transformer(src, tgt)
-        output = self.fc(output)
+
+        encoder_output = self.transformer_encoder(
+                src.transpose(0, 1)).transpose(0, 1)
+        decoder_output = self.transformer_decoder(
+                tgt.transpose(0, 1),
+                encoder_output.transpose(0, 1)).transpose(0, 1)
+        output = self.fc(decoder_output)
         return output
 
 
@@ -192,19 +202,22 @@ def generate_text(model, tokenizer, device, max_seq_length=128, start_text=""):
     input_ids = torch.tensor(input_ids,
                              dtype=torch.long).unsqueeze(0).to(device)
 
+    output_ids = input_ids.clone()
+
     with torch.no_grad():
         for _ in range(max_seq_length):
-            output = model(input_ids[:, :-1], input_ids)
+            output = model(input_ids, output_ids)
             next_token_id = torch.argmax(output[:, -1, :], dim=-1)
 
-            input_ids = torch.cat((input_ids,
-                                  next_token_id.unsqueeze(0)), dim=1)
+            output_ids = torch.cat((output_ids,
+                                    next_token_id.unsqueeze(0)), dim=1)
+
             if next_token_id.item() == tokenizer.eos_token_id:
                 break
-            if len(input_ids[0]) >= max_seq_length:
+            if len(output_ids[0]) >= max_seq_length:
                 break
 
-        generated_ids = input_ids.squeeze().tolist()
+        generated_ids = output_ids.squeeze().tolist()
 
     generated_text = tokenizer.decode(generated_ids,
                                       skip_special_tokens=True)
@@ -225,14 +238,12 @@ def main():
                         help="Text to start generation from.")
     parser.add_argument("--batch_size",
                         type=int, default=16, help="Batch size.")
-    parser.add_argument("--embed_dim",
-                        type=int, default=32, help="Embedding dimension.")
     parser.add_argument("--hidden_dim",
-                        type=int, default=32, help="Hidden dimension.")
+                        type=int, default=2048, help="Hidden dimension.")
     parser.add_argument("--n_head",
-                        type=int, default=4, help="Number of attention heads.")
+                        type=int, default=8, help="Number of attention heads.")
     parser.add_argument("--n_layers",
-                        type=int, default=2,
+                        type=int, default=6,
                         help="Number of transformer layers.")
     parser.add_argument("--learning_rate",
                         type=float, default=0.001, help="Learning rate.")
@@ -260,10 +271,6 @@ def main():
     file_path = args.text_file
     start_text = args.start_text
     BATCH_SIZE = args.batch_size
-    EMBED_DIM = args.embed_dim
-    HIDDEN_DIM = args.hidden_dim
-    N_HEAD = args.n_head
-    N_LAYERS = args.n_layers
     LEARNING_RATE = args.learning_rate
     NUM_EPOCHS = args.num_epochs
     MAX_SEQ_LENGTH = args.max_seq_length
@@ -272,6 +279,9 @@ def main():
     CLIP_NORM = args.clip_norm
     TRAIN_VAL_SPLIT = args.train_val_split
     LOAD_MODEL_PATH = args.load_model
+    HIDDEN_DIM = args.hidden_dim
+    N_HEAD = args.n_head
+    N_LAYERS = args.n_layers
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
@@ -303,7 +313,7 @@ def main():
     print("Using device:", device)
 
     model = TextTransformer(
-        vocab_size, EMBED_DIM, HIDDEN_DIM, N_HEAD, N_LAYERS, MAX_SEQ_LENGTH
+        MODEL_NAME, vocab_size, MAX_SEQ_LENGTH, N_HEAD, N_LAYERS, HIDDEN_DIM
     ).to(device)
 
     if LOAD_MODEL_PATH:
