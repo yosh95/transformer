@@ -3,336 +3,231 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import argparse
-from transformers import AutoTokenizer, AutoModel
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
-from torch.nn import TransformerDecoder, TransformerDecoderLayer
+import torch.nn.functional as F
+import math
+
+D_MODEL = 512
+N_HEAD = 8
+N_LAYERS = 6
+D_FF = 2048
+DROPOUT = 0.1
+MAX_SEQ_LEN = 100
+VOCAB_SIZE = 1000
 
 
-PAD_TOKEN = "<pad>"
-UNK_TOKEN = "<unk>"
-BOS_TOKEN = "<bos>"
-EOS_TOKEN = "<eos>"
+class Embedding(nn.Module):
+    def __init__(self, vocab_size, d_model):
+        super(Embedding, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.d_model = d_model
 
-
-def load_text(file_path):
-    """Loads text from a file with error handling."""
-    try:
-        with open(file_path, "r", encoding="utf-8") as file:
-            text = file.read()
-        return text
-    except FileNotFoundError:
-        print(f"Error: File not found at {file_path}")
-        exit(1)
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        exit(1)
-
-
-def prepare_data(tokenizer, text, max_seq_length):
-    """Prepares the data for the model."""
-    tokens = tokenizer.tokenize(text)
-    data = []
-    for i in range(0, len(tokens) - max_seq_length, 1):
-        input_tokens = tokens[i:i + max_seq_length]
-        target_tokens = tokens[i + 1:i + max_seq_length + 1]
-
-        input_ids = tokenizer.convert_tokens_to_ids(input_tokens)
-        target_ids = tokenizer.convert_tokens_to_ids(target_tokens)
-
-        data.append((input_ids, target_ids))
-
-    return data
-
-
-class TextDataset(Dataset):
-    """Dataset for the text data."""
-
-    def __init__(self, data, pad_token_id, max_seq_length):
-        self.data = data
-        self.pad_token_id = pad_token_id
-        self.max_seq_length = max_seq_length
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        input_ids, target_ids = self.data[idx]
-        input_ids = torch.tensor(input_ids, dtype=torch.long)
-        target_ids = torch.tensor(target_ids, dtype=torch.long)
-
-        if len(input_ids) < self.max_seq_length:
-            pad_len = self.max_seq_length - len(input_ids)
-            input_ids = torch.cat(
-                [input_ids, torch.full((pad_len,), self.pad_token_id)]
-            )
-            target_ids = torch.cat(
-                [target_ids, torch.full((pad_len,), self.pad_token_id)]
-            )
-        return input_ids, target_ids
-
-
-def create_dataloader(data, pad_token_id, batch_size, max_seq_length,
-                      shuffle=True):
-    """Creates a DataLoader for the dataset."""
-    dataset = TextDataset(data, pad_token_id, max_seq_length)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-    return dataloader
+    def forward(self, x):
+        return self.embedding(x) * math.sqrt(self.d_model)
 
 
 class PositionalEncoding(nn.Module):
-    """Positional Encoding module."""
-
-    def __init__(self, embed_dim, max_seq_length):
-        super().__init__()
-        encoding = torch.zeros(max_seq_length, embed_dim)
-        position = torch.arange(0,
-                                max_seq_length,
-                                dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, embed_dim, 2).float() *
-            (-torch.log(torch.tensor(10000.0)) / embed_dim)
-        )
-        encoding[:, 0::2] = torch.sin(position * div_term)
-        encoding[:, 1::2] = torch.cos(position * div_term)
-        encoding = encoding.unsqueeze(0)
-        self.register_buffer("positional_encoding", encoding)
+    def __init__(self, d_model, max_seq_len):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_seq_len, d_model)
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() *
+                             (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        """Apply positional encodings."""
-        return x + self.positional_encoding[:, :x.size(1), :]
+        return x + self.pe[:, :x.size(1)]
 
 
-class TextTransformer(nn.Module):
-    """Text Transformer model (Encoder-Decoder)."""
+def scaled_dot_product_attention(query, key, value, mask=None):
+    d_k = query.size(-1)
+    attn_scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+    if mask is not None:
+        attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+    attn_probs = F.softmax(attn_scores, dim=-1)
+    output = torch.matmul(attn_probs, value)
+    return output, attn_probs
 
-    def __init__(self, model_name, vocab_size, max_seq_length, n_head,
-                 n_layers, hidden_dim):
-        super().__init__()
-        self.pretrained_model = AutoModel.from_pretrained(model_name)
-        embed_dim = self.pretrained_model.config.hidden_size
-        self.embedding = self.pretrained_model.embeddings.word_embeddings
-        self.positional_encoding = PositionalEncoding(
-            embed_dim, max_seq_length)
 
-        encoder_layers = TransformerEncoderLayer(
-            d_model=embed_dim, nhead=n_head, dim_feedforward=hidden_dim)
-        self.transformer_encoder = TransformerEncoder(
-            encoder_layers, num_layers=n_layers)
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_head):
+        super(MultiHeadAttention, self).__init__()
+        self.d_model = d_model
+        self.n_head = n_head
+        self.d_k = d_model // n_head
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
 
-        decoder_layers = TransformerDecoderLayer(
-            d_model=embed_dim, nhead=n_head, dim_feedforward=hidden_dim)
-        self.transformer_decoder = TransformerDecoder(
-            decoder_layers, num_layers=n_layers)
+    def forward(self, query, key, value, mask=None):
+        batch_size = query.size(0)
 
-        self.fc = nn.Linear(embed_dim, vocab_size)
+        q = self.W_q(query).view(batch_size,
+                                 -1, self.n_head, self.d_k).transpose(1, 2)
+        k = self.W_k(key).view(batch_size,
+                               -1, self.n_head, self.d_k).transpose(1, 2)
+        v = self.W_v(value).view(batch_size,
+                                 -1, self.n_head, self.d_k).transpose(1, 2)
 
-    def forward(self, src, tgt):
-        src = self.embedding(src) * torch.sqrt(
-            torch.tensor(src.size(-1), dtype=torch.float))
-        src = self.positional_encoding(src)
-        tgt = self.embedding(tgt) * torch.sqrt(
-            torch.tensor(tgt.size(-1), dtype=torch.float))
-        tgt = self.positional_encoding(tgt)
+        attn_output, attn_probs = scaled_dot_product_attention(q, k, v, mask)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
+                batch_size, -1, self.d_model)
 
-        encoder_output = self.transformer_encoder(
-                src.transpose(0, 1)).transpose(0, 1)
-        decoder_output = self.transformer_decoder(
-                tgt.transpose(0, 1),
-                encoder_output.transpose(0, 1)).transpose(0, 1)
-        output = self.fc(decoder_output)
+        output = self.W_o(attn_output)
+        return output, attn_probs
+
+
+class FeedForwardNetwork(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super(FeedForwardNetwork, self).__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, n_head, d_ff, dropout):
+        super(EncoderLayer, self).__init__()
+        self.attn = MultiHeadAttention(d_model, n_head)
+        self.ffn = FeedForwardNetwork(d_model, d_ff)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask):
+        attn_output, _ = self.attn(x, x, x, mask)
+        x = self.norm1(x + self.dropout(attn_output))
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + self.dropout(ffn_output))
+        return x
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, n_head, d_ff, dropout):
+        super(DecoderLayer, self).__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_head)
+        self.enc_attn = MultiHeadAttention(d_model, n_head)
+        self.ffn = FeedForwardNetwork(d_model, d_ff)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, enc_output, src_mask, tgt_mask):
+        attn_output, _ = self.self_attn(x, x, x, tgt_mask)
+        x = self.norm1(x + self.dropout(attn_output))
+        enc_attn_output, _ = self.enc_attn(x, enc_output, enc_output, src_mask)
+        x = self.norm2(x + self.dropout(enc_attn_output))
+        ffn_output = self.ffn(x)
+        x = self.norm3(x + self.dropout(ffn_output))
+        return x
+
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head,
+                 n_layers, d_ff, dropout, max_seq_len):
+        super(Encoder, self).__init__()
+        self.embedding = Embedding(vocab_size, d_model)
+        self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
+        self.layers = nn.ModuleList(
+                [EncoderLayer(d_model, n_head, d_ff, dropout)
+                 for _ in range(n_layers)])
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask):
+        x = self.embedding(x)
+        x = self.pos_encoding(x)
+        x = self.dropout(x)
+        for layer in self.layers:
+            x = layer(x, mask)
+        return x
+
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head, n_layers,
+                 d_ff, dropout, max_seq_len):
+        super(Decoder, self).__init__()
+        self.embedding = Embedding(vocab_size, d_model)
+        self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
+        self.layers = nn.ModuleList(
+                [DecoderLayer(d_model, n_head, d_ff, dropout)
+                 for _ in range(n_layers)])
+        self.fc = nn.Linear(d_model, vocab_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, enc_output, src_mask, tgt_mask):
+        x = self.embedding(x)
+        x = self.pos_encoding(x)
+        x = self.dropout(x)
+        for layer in self.layers:
+            x = layer(x, enc_output, src_mask, tgt_mask)
+        x = self.fc(x)
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, src_vocab_size, tgt_vocab_size, d_model,
+                 n_head, n_layers, d_ff, dropout, max_seq_len):
+        super(Transformer, self).__init__()
+        self.encoder = Encoder(src_vocab_size, d_model, n_head,
+                               n_layers, d_ff, dropout, max_seq_len)
+        self.decoder = Decoder(tgt_vocab_size, d_model, n_head,
+                               n_layers, d_ff, dropout, max_seq_len)
+
+    def generate_mask(self, x, pad_idx):
+        mask = (x != pad_idx).unsqueeze(1).unsqueeze(2)
+        return mask
+
+    def generate_subsequent_mask(self, x):
+        sz = x.size(1)
+        mask = torch.triu(torch.ones(sz, sz, device=x.device),
+                          diagonal=1).bool()
+        return mask
+
+    def forward(self, src, tgt, src_pad_idx, tgt_pad_idx):
+        src_mask = self.generate_mask(src, src_pad_idx)
+        tgt_mask = self.generate_mask(tgt, tgt_pad_idx)
+        tgt_mask = tgt_mask & (~self.generate_subsequent_mask(tgt))
+
+        enc_output = self.encoder(src, src_mask)
+        output = self.decoder(tgt, enc_output, src_mask, tgt_mask)
         return output
 
 
-def train_epoch(model, dataloader, criterion, optimizer,
-                device, clip_norm=1.0):
-    """Trains the model for one epoch."""
-    model.train()
-    epoch_loss = 0
-    for src_batch, tgt_batch in dataloader:
-        src_batch = src_batch.to(device)
-        tgt_batch = tgt_batch.to(device)
-        optimizer.zero_grad()
-
-        output = model(src_batch[:, :-1], tgt_batch[:, :-1])
-        loss = criterion(output.reshape(-1, output.size(-1)),
-                         tgt_batch[:, 1:].reshape(-1))
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-        optimizer.step()
-        epoch_loss += loss.item()
-
-    return epoch_loss / len(dataloader)
-
-
-def train(model, train_dataloader, criterion, optimizer,
-          scheduler, device, num_epochs, clip_norm):
-    """Trains the model."""
-    for epoch in range(num_epochs):
-        train_loss = train_epoch(model, train_dataloader, criterion,
-                                 optimizer, device, clip_norm)
-
-        if isinstance(scheduler,
-                      torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(train_loss)
-        else:
-            scheduler.step()
-
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch: {epoch+1}/{num_epochs}, " +
-              f"Train Loss: {train_loss:.4f}, " +
-              f"LR: {current_lr:.6f}")
-
-    print("Training finished!")
-
-
-def generate_text(model, tokenizer, device, max_seq_length=128, start_text=""):
-    """Generates text from the model."""
-    model.eval()
-    tokens = tokenizer.tokenize(start_text)
-
-    if tokenizer.bos_token is None:
-        bos_token = BOS_TOKEN
-    else:
-        bos_token = tokenizer.bos_token
-
-    input_ids = tokenizer.convert_tokens_to_ids(
-        [bos_token] + tokens)
-    input_ids = torch.tensor(input_ids,
-                             dtype=torch.long).unsqueeze(0).to(device)
-
-    output_ids = input_ids.clone()
-
-    with torch.no_grad():
-        for _ in range(max_seq_length):
-            output = model(input_ids, output_ids)
-            next_token_id = torch.argmax(output[:, -1, :], dim=-1)
-
-            output_ids = torch.cat((output_ids,
-                                    next_token_id.unsqueeze(0)), dim=1)
-
-            if next_token_id.item() == tokenizer.eos_token_id:
-                break
-            if len(output_ids[0]) >= max_seq_length:
-                break
-
-        generated_ids = output_ids.squeeze().tolist()
-
-    generated_text = tokenizer.decode(generated_ids,
-                                      skip_special_tokens=True)
-    return generated_text.strip()
-
-
-def load_model(model, model_path, device):
-    """Loads the model from the given path."""
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    return model
+def train_step(model, optimizer, criterion, src, tgt,
+               src_pad_idx, tgt_pad_idx):
+    optimizer.zero_grad()
+    output = model(src, tgt[:, :-1], src_pad_idx, tgt_pad_idx)
+    loss = criterion(output.view(-1, VOCAB_SIZE), tgt[:, 1:].reshape(-1))
+    loss.backward()
+    optimizer.step()
+    return loss.item()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a Transformer model.")
-    parser.add_argument("text_file", type=str, help="Path to the text file.")
-    parser.add_argument("--start_text",
-                        type=str, default="",
-                        help="Text to start generation from.")
-    parser.add_argument("--batch_size",
-                        type=int, default=16, help="Batch size.")
-    parser.add_argument("--hidden_dim",
-                        type=int, default=2048, help="Hidden dimension.")
-    parser.add_argument("--n_head",
-                        type=int, default=8, help="Number of attention heads.")
-    parser.add_argument("--n_layers",
-                        type=int, default=6,
-                        help="Number of transformer layers.")
-    parser.add_argument("--learning_rate",
-                        type=float, default=0.001, help="Learning rate.")
-    parser.add_argument("--num_epochs",
-                        type=int, default=100,
-                        help="Number of training epochs.")
-    parser.add_argument("--max_seq_length",
-                        type=int, default=32, help="Maximum sequence length.")
-    parser.add_argument("--model_name",
-                        type=str, default="bert-base-uncased",
-                        help="Name of the pretrained tokenizer model.")
-    parser.add_argument("--weight_decay", type=float,
-                        default=0.01,
-                        help="Weight decay.")
-    parser.add_argument("--clip_norm", type=float,
-                        default=1.0,
-                        help="Gradient clipping norm.")
-    parser.add_argument("--train_val_split", type=float, default=0.8,
-                        help="Proportion of data to use for training")
-    parser.add_argument("--load_model", type=str, default=None,
-                        help="Path to load a pretrained model")
+    src_data = torch.randint(0, VOCAB_SIZE, (64, MAX_SEQ_LEN))
+    tgt_data = torch.randint(0, VOCAB_SIZE, (64, MAX_SEQ_LEN))
+    src_pad_idx = 0
+    tgt_pad_idx = 0
 
-    args = parser.parse_args()
+    model = Transformer(VOCAB_SIZE, VOCAB_SIZE, D_MODEL, N_HEAD,
+                        N_LAYERS, D_FF, DROPOUT, MAX_SEQ_LEN)
 
-    file_path = args.text_file
-    start_text = args.start_text
-    BATCH_SIZE = args.batch_size
-    LEARNING_RATE = args.learning_rate
-    NUM_EPOCHS = args.num_epochs
-    MAX_SEQ_LENGTH = args.max_seq_length
-    MODEL_NAME = args.model_name
-    WEIGHT_DECAY = args.weight_decay
-    CLIP_NORM = args.clip_norm
-    TRAIN_VAL_SPLIT = args.train_val_split
-    LOAD_MODEL_PATH = args.load_model
-    HIDDEN_DIM = args.hidden_dim
-    N_HEAD = args.n_head
-    N_LAYERS = args.n_layers
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({'pad_token': PAD_TOKEN})
-
-    if tokenizer.unk_token is None:
-        tokenizer.add_special_tokens({'unk_token': UNK_TOKEN})
-
-    if tokenizer.eos_token is None:
-        tokenizer.add_special_tokens({'eos_token': EOS_TOKEN})
-
-    text = load_text(file_path)
-    data = prepare_data(tokenizer, text, MAX_SEQ_LENGTH)
-
-    # Split data into training and validation sets
-    split_idx = int(len(data) * TRAIN_VAL_SPLIT)
-    train_data = data[:split_idx]
-
-    train_dataloader = create_dataloader(train_data,
-                                         tokenizer.pad_token_id,
-                                         BATCH_SIZE,
-                                         MAX_SEQ_LENGTH,
-                                         shuffle=True)
-
-    vocab_size = len(tokenizer)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
-
-    model = TextTransformer(
-        MODEL_NAME, vocab_size, MAX_SEQ_LENGTH, N_HEAD, N_LAYERS, HIDDEN_DIM
-    ).to(device)
-
-    if LOAD_MODEL_PATH:
-        model = load_model(model, LOAD_MODEL_PATH, device)
-        print(f"Model loaded from {LOAD_MODEL_PATH}")
-
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE,
-                            weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 'min', patience=5, factor=0.5)
-
-    train(model, train_dataloader, criterion, optimizer,
-          scheduler, device, NUM_EPOCHS, CLIP_NORM)
-
-    generated_text = generate_text(
-        model, tokenizer, device, MAX_SEQ_LENGTH, start_text
-    )
-    print(f"Generated Text based on '{start_text}': {generated_text}")
+    num_epochs = 10
+    for epoch in range(num_epochs):
+        loss = train_step(model, optimizer, criterion, src_data,
+                          tgt_data, src_pad_idx, tgt_pad_idx)
+        print(f"Epoch: {epoch+1}/{num_epochs}, Loss: {loss:.4f}")
 
 
 if __name__ == "__main__":
