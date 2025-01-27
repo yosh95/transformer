@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import pdb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -219,16 +220,21 @@ class Transformer(nn.Module):
         output = self.decoder(tgt, enc_output, src_mask, tgt_mask)
         return output
 
-    def generate_text(self, src, vocab, max_gen_len, max_seq_len):
+    def generate_text(self,
+                      src,
+                      vocab,
+                      max_gen_len,
+                      max_seq_len,
+                      start_token_id):
         model = self
         model.eval()
         with torch.no_grad():
             enc_output = model.encoder(src,
                                        model.generate_mask(src, self.pad_idx))
 
-            # Initialize target sequence with <sos> token
+            # Initialize target sequence with specified start token
             tgt = torch.full((src.size(0), 1),
-                             self.sos_idx,
+                             start_token_id,
                              dtype=torch.long,
                              device=src.device)
             tgt_save = copy.deepcopy(tgt)
@@ -373,6 +379,8 @@ def main():
                         help="Path for save model.")
     parser.add_argument("--load_path", type=str, default="",
                         help="Path for load model.")
+    parser.add_argument("--start_token", type=str, default="",
+                        help="Start token for generate text.")
 
     args = parser.parse_args()
 
@@ -429,10 +437,25 @@ def main():
     torch.save(model.state_dict(), args.save_path)
     print(f"Model saved at {args.save_path}")
 
+    start_token = args.start_token
+    if start_token:
+        if start_token in vocab:
+            start_token_id = vocab.index(start_token)
+            print(f"Start token '{start_token}' found in vocabulary, " +
+                  "index is {start_token_id}")
+        else:
+            print(f"Start token '{start_token}' not found in vocabulary, " +
+                  "defaulting to SOS_TOKEN")
+            start_token_id = sos_idx
+    else:
+        print("Start token not provided, defaulting to SOS_TOKEN")
+        start_token_id = sos_idx
+
     generated_text = model.generate_text(src[:1],
                                          vocab,
                                          args.max_gen_len,
-                                         args.max_seq_len)
+                                         args.max_seq_len,
+                                         start_token_id)
     print(f"\nGenerated Text: \n{generated_text}")
 
 
