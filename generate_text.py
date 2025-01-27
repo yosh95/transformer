@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import pdb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,16 +14,18 @@ from collections import Counter
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 
-D_MODEL = 16
+D_MODEL = 128
 N_HEAD = 4
 N_LAYERS = 2
-D_FF = 16
+D_FF = 128
 DROPOUT = 0.1
-MAX_SEQ_LEN = 100
-LEARNING_RATE = 0.01
+MAX_SEQ_LEN = 10
+LEARNING_RATE = 0.001
 WEIGHT_DECAY = 0.01
-NUM_EPOCHS = 2000
+NUM_EPOCHS = 1000
 SMOOTHING_WINDOW = 10
+MAX_GEN_LEN = 100
+SOS_TOKEN = "<sos>"
 
 
 class Embedding(nn.Module):
@@ -230,8 +233,8 @@ def tokenize_text(text):
 
 def build_vocab(tokens):
     token_counts = Counter(tokens)
-    vocab = ["<pad>", "<unk>"] + [token for token,
-                                  count in token_counts.items()]
+    vocab = ["<pad>", "<unk>", SOS_TOKEN] + [token for token,
+                                             count in token_counts.items()]
     token_to_id = {token: id_ for id_, token in enumerate(vocab)}
     return vocab, token_to_id
 
@@ -250,28 +253,59 @@ def prepare_data(text_file, max_seq_len):
         text = file.read()
     tokens = tokenize_text(text)
     vocab, token_to_id = build_vocab(tokens)
-    ids = tokens_to_ids(tokens, token_to_id)
     pad_idx = 0
-    ids = pad_sequence(ids, max_seq_len, pad_idx)
+    sos_idx = token_to_id[SOS_TOKEN]
 
-    src = torch.tensor([ids], dtype=torch.long)
-    tgt = torch.tensor([ids], dtype=torch.long)
-    return src, tgt, pad_idx, len(vocab)
+    src_sequences = []
+    tgt_sequences = []
+    for i in range(0, len(tokens) - max_seq_len + 1):
+        src_seq = tokens[i:i + max_seq_len]
+        tgt_seq = tokens[i+1:i + max_seq_len+1]
+
+        src_ids = tokens_to_ids(src_seq, token_to_id)
+        tgt_ids = tokens_to_ids(tgt_seq, token_to_id)
+
+        src_ids = pad_sequence(src_ids, max_seq_len, pad_idx)
+
+        tgt_ids = [sos_idx] + tgt_ids
+        tgt_ids = pad_sequence(tgt_ids, max_seq_len, pad_idx)
+
+        src_sequences.append(src_ids)
+        tgt_sequences.append(tgt_ids)
+
+    src = torch.tensor(src_sequences, dtype=torch.long)
+    tgt = torch.tensor(tgt_sequences, dtype=torch.long)
+
+    return src, tgt, pad_idx, sos_idx, len(vocab)
 
 
-def generate_text(model, src, src_pad_idx, vocab, max_seq_len):
+def generate_text(model, src, src_pad_idx, sos_idx, pad_idx,
+                  vocab, max_gen_len, max_seq_len):
     model.eval()
     with torch.no_grad():
-        tgt = torch.full((1, 1), src_pad_idx, dtype=torch.long)
-        for i in range(max_seq_len - 1):
-            output = model(src, tgt, src_pad_idx, src_pad_idx)
+        tgt = torch.full((1, 1), sos_idx, dtype=torch.long)
+        enc_output = model.encoder(src, model.generate_mask(src, src_pad_idx))
+
+        for _ in range(max_gen_len):
+            output = model.decoder(
+                tgt,
+                enc_output,
+                model.generate_mask(src, src_pad_idx),
+                model.generate_mask(tgt, pad_idx),
+            )
             next_token = output[:, -1, :].argmax(dim=-1)
+
+            if next_token.item() == pad_idx:
+                break
+
+            if tgt.size(1) >= max_seq_len:
+                tgt = tgt[:, 1:]
+
             tgt = torch.cat([tgt, next_token.unsqueeze(1)], dim=1)
 
     generated_ids = tgt.squeeze().tolist()
-    generated_tokens = [vocab[id_]
-                        for id_ in generated_ids
-                        if id_ < len(vocab) and id_ != 0]
+    generated_tokens = [vocab[id_] for id_ in generated_ids
+                        if id_ < len(vocab) and id_ != 0 and id_ != sos_idx]
     generated_text = ' '.join(generated_tokens)
     return generated_text
 
@@ -297,7 +331,8 @@ def main():
         print(f"Error: The file '{args.text_file}' does not exist.")
         return
 
-    src, tgt, pad_idx, vocab_size = prepare_data(args.text_file, MAX_SEQ_LEN)
+    src, tgt, pad_idx, sos_idx, vocab_size = prepare_data(args.text_file,
+                                                          MAX_SEQ_LEN)
 
     model = Transformer(vocab_size, vocab_size, D_MODEL, N_HEAD,
                         N_LAYERS, D_FF, DROPOUT, MAX_SEQ_LEN)
@@ -323,7 +358,8 @@ def main():
 
     vocab = build_vocab(tokenize_text(open(args.text_file,
                                            'r', encoding='utf-8').read()))[0]
-    generated_text = generate_text(model, src, pad_idx, vocab, MAX_SEQ_LEN)
+    generated_text = generate_text(model, src[:1], pad_idx, sos_idx, pad_idx,
+                                   vocab, MAX_GEN_LEN, MAX_SEQ_LEN)
     print(f"\nGenerated Text: \n{generated_text}")
 
 
