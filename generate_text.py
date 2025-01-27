@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import pdb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,22 +8,14 @@ import math
 import argparse
 import os
 import string
+import copy
 
 from collections import Counter
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 
-D_MODEL = 128
-N_HEAD = 4
-N_LAYERS = 2
-D_FF = 128
-DROPOUT = 0.1
-MAX_SEQ_LEN = 10
-LEARNING_RATE = 0.001
-WEIGHT_DECAY = 0.01
-NUM_EPOCHS = 1000
-SMOOTHING_WINDOW = 10
-MAX_GEN_LEN = 100
+EOS_TOKEN = "<eos>"
+PAD_TOKEN = "<pad>"
 SOS_TOKEN = "<sos>"
 
 
@@ -136,7 +127,10 @@ class DecoderLayer(nn.Module):
     def forward(self, x, enc_output, src_mask, tgt_mask):
         attn_output, _ = self.self_attn(x, x, x, tgt_mask)
         x = self.norm1(x + self.dropout(attn_output))
-        enc_attn_output, _ = self.enc_attn(x, enc_output, enc_output, src_mask)
+        enc_attn_output, _ = self.enc_attn(x,
+                                           enc_output,
+                                           enc_output,
+                                           src_mask)
         x = self.norm2(x + self.dropout(enc_attn_output))
         ffn_output = self.ffn(x)
         x = self.norm3(x + self.dropout(ffn_output))
@@ -186,13 +180,25 @@ class Decoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, src_vocab_size, tgt_vocab_size, d_model,
-                 n_head, n_layers, d_ff, dropout, max_seq_len):
+    def __init__(self,
+                 src_vocab_size,
+                 tgt_vocab_size, d_model,
+                 n_head,
+                 n_layers,
+                 d_ff,
+                 dropout,
+                 max_seq_len,
+                 pad_idx,
+                 eos_idx,
+                 sos_idx):
         super(Transformer, self).__init__()
         self.encoder = Encoder(src_vocab_size, d_model, n_head,
                                n_layers, d_ff, dropout, max_seq_len)
         self.decoder = Decoder(tgt_vocab_size, d_model, n_head,
                                n_layers, d_ff, dropout, max_seq_len)
+        self.pad_idx = pad_idx
+        self.eos_idx = eos_idx
+        self.sos_idx = sos_idx
 
     def generate_mask(self, x, pad_idx):
         mask = (x != pad_idx).unsqueeze(1).unsqueeze(2)
@@ -204,20 +210,64 @@ class Transformer(nn.Module):
                           diagonal=1).bool()
         return mask
 
-    def forward(self, src, tgt, src_pad_idx, tgt_pad_idx):
-        src_mask = self.generate_mask(src, src_pad_idx)
-        tgt_mask = self.generate_mask(tgt, tgt_pad_idx)
+    def forward(self, src, tgt):
+        src_mask = self.generate_mask(src, self.pad_idx)
+        tgt_mask = self.generate_mask(tgt, self.pad_idx)
         tgt_mask = tgt_mask & (~self.generate_subsequent_mask(tgt))
 
         enc_output = self.encoder(src, src_mask)
         output = self.decoder(tgt, enc_output, src_mask, tgt_mask)
         return output
 
+    def generate_text(self, src, vocab, max_gen_len, max_seq_len):
+        model = self
+        model.eval()
+        with torch.no_grad():
+            enc_output = model.encoder(src,
+                                       model.generate_mask(src, self.pad_idx))
 
-def train_step(model, optimizer, criterion, src, tgt,
-               src_pad_idx, tgt_pad_idx, vocab_size):
+            # Initialize target sequence with <sos> token
+            tgt = torch.full((src.size(0), 1),
+                             self.sos_idx,
+                             dtype=torch.long,
+                             device=src.device)
+            tgt_save = copy.deepcopy(tgt)
+
+            for i in range(max_gen_len):
+                output = model.decoder(
+                    tgt,
+                    enc_output,
+                    model.generate_mask(src, self.pad_idx),
+                    model.generate_mask(tgt, self.pad_idx),
+                )
+                next_token = output[:, -1, :].argmax(dim=-1)
+
+                if next_token.item() == self.pad_idx:
+                    print("A pad token found.")
+                    break
+
+                if next_token.item() == self.eos_idx:
+                    print("An eos token is found.")
+                    break
+
+                if tgt.size(1) >= max_seq_len:
+                    tgt = tgt[:, 1:]
+
+                tgt = torch.cat([tgt, next_token.unsqueeze(1)], dim=1)
+                tgt_save = torch.cat([tgt_save, next_token.unsqueeze(1)],
+                                     dim=1)
+
+        generated_ids = tgt_save.squeeze().tolist()
+        generated_tokens = [vocab[id_] for id_ in generated_ids
+                            if id_ < len(vocab) and id_ != 0 and
+                            id_ != self.sos_idx]
+        generated_text = ' '.join(generated_tokens)
+        return generated_text
+
+
+def train_step(model, optimizer, criterion, src, tgt, vocab_size):
     optimizer.zero_grad()
-    output = model(src, tgt[:, :-1], src_pad_idx, tgt_pad_idx)
+    output = model(src, tgt[:, :-1])
     loss = criterion(output.view(-1, vocab_size), tgt[:, 1:].reshape(-1))
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -233,14 +283,14 @@ def tokenize_text(text):
 
 def build_vocab(tokens):
     token_counts = Counter(tokens)
-    vocab = ["<pad>", "<unk>", SOS_TOKEN] + [token for token,
-                                             count in token_counts.items()]
+    vocab = [PAD_TOKEN, EOS_TOKEN, SOS_TOKEN] + \
+            [token for token, count in token_counts.items()]
     token_to_id = {token: id_ for id_, token in enumerate(vocab)}
     return vocab, token_to_id
 
 
 def tokens_to_ids(tokens, token_to_id):
-    return [token_to_id.get(token, 1) for token in tokens]
+    return [token_to_id.get(token, token_to_id[PAD_TOKEN]) for token in tokens]
 
 
 def pad_sequence(seq, max_len, pad_idx):
@@ -253,21 +303,23 @@ def prepare_data(text_file, max_seq_len):
         text = file.read()
     tokens = tokenize_text(text)
     vocab, token_to_id = build_vocab(tokens)
-    pad_idx = 0
+    pad_idx = token_to_id[PAD_TOKEN]
+    eos_idx = token_to_id[EOS_TOKEN]
     sos_idx = token_to_id[SOS_TOKEN]
+
+    # Add <sos> and <eos> tokens
+    tokens_with_sos_eos = [SOS_TOKEN] + tokens + [EOS_TOKEN]
 
     src_sequences = []
     tgt_sequences = []
-    for i in range(0, len(tokens) - max_seq_len + 1):
-        src_seq = tokens[i:i + max_seq_len]
-        tgt_seq = tokens[i+1:i + max_seq_len+1]
+    for i in range(0, len(tokens_with_sos_eos) - max_seq_len):
+        src_seq = tokens_with_sos_eos[i:i + max_seq_len]
+        tgt_seq = tokens_with_sos_eos[i + 1:i + max_seq_len + 1]
 
         src_ids = tokens_to_ids(src_seq, token_to_id)
         tgt_ids = tokens_to_ids(tgt_seq, token_to_id)
 
         src_ids = pad_sequence(src_ids, max_seq_len, pad_idx)
-
-        tgt_ids = [sos_idx] + tgt_ids
         tgt_ids = pad_sequence(tgt_ids, max_seq_len, pad_idx)
 
         src_sequences.append(src_ids)
@@ -276,38 +328,7 @@ def prepare_data(text_file, max_seq_len):
     src = torch.tensor(src_sequences, dtype=torch.long)
     tgt = torch.tensor(tgt_sequences, dtype=torch.long)
 
-    return src, tgt, pad_idx, sos_idx, len(vocab)
-
-
-def generate_text(model, src, src_pad_idx, sos_idx, pad_idx,
-                  vocab, max_gen_len, max_seq_len):
-    model.eval()
-    with torch.no_grad():
-        tgt = torch.full((1, 1), sos_idx, dtype=torch.long)
-        enc_output = model.encoder(src, model.generate_mask(src, src_pad_idx))
-
-        for _ in range(max_gen_len):
-            output = model.decoder(
-                tgt,
-                enc_output,
-                model.generate_mask(src, src_pad_idx),
-                model.generate_mask(tgt, pad_idx),
-            )
-            next_token = output[:, -1, :].argmax(dim=-1)
-
-            if next_token.item() == pad_idx:
-                break
-
-            if tgt.size(1) >= max_seq_len:
-                tgt = tgt[:, 1:]
-
-            tgt = torch.cat([tgt, next_token.unsqueeze(1)], dim=1)
-
-    generated_ids = tgt.squeeze().tolist()
-    generated_tokens = [vocab[id_] for id_ in generated_ids
-                        if id_ < len(vocab) and id_ != 0 and id_ != sos_idx]
-    generated_text = ' '.join(generated_tokens)
-    return generated_text
+    return src, tgt, pad_idx, eos_idx, sos_idx, len(vocab), vocab
 
 
 def init_weights(m):
@@ -325,41 +346,93 @@ def main():
                     "generate text from a text file.")
     parser.add_argument("text_file", type=str,
                         help="Path to the input text file.")
+    parser.add_argument("--d_model", type=int, default=128,
+                        help="Dimension of model.")
+    parser.add_argument("--n_head", type=int, default=4,
+                        help="Number of heads in attention.")
+    parser.add_argument("--n_layers", type=int, default=2,
+                        help="Number of layers in encoder/decoder.")
+    parser.add_argument("--d_ff", type=int, default=128,
+                        help="Dimension of feedforward network.")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                        help="Dropout rate.")
+    parser.add_argument("--max_seq_len", type=int, default=10,
+                        help="Maximum sequence length.")
+    parser.add_argument("--learning_rate", type=float, default=0.001,
+                        help="Learning rate.")
+    parser.add_argument("--weight_decay", type=float, default=0.01,
+                        help="Weight decay.")
+    parser.add_argument("--num_epochs", type=int, default=100,
+                        help="Number of training epochs.")
+    parser.add_argument("--smoothing_window", type=int, default=10,
+                        help="Smoothing window for loss.")
+    parser.add_argument("--max_gen_len", type=int, default=100,
+                        help="Maximum length of generated text.")
+    parser.add_argument("--save_path", type=str,
+                        default="transformer_model.pt",
+                        help="Path for save model.")
+    parser.add_argument("--load_path", type=str, default="",
+                        help="Path for load model.")
+
     args = parser.parse_args()
 
     if not os.path.exists(args.text_file):
         print(f"Error: The file '{args.text_file}' does not exist.")
         return
 
-    src, tgt, pad_idx, sos_idx, vocab_size = prepare_data(args.text_file,
-                                                          MAX_SEQ_LEN)
+    src, tgt, pad_idx, eos_idx, sos_idx, vocab_size, vocab = prepare_data(
+            args.text_file,
+            args.max_seq_len)
 
-    model = Transformer(vocab_size, vocab_size, D_MODEL, N_HEAD,
-                        N_LAYERS, D_FF, DROPOUT, MAX_SEQ_LEN)
+    model = Transformer(vocab_size,
+                        vocab_size,
+                        args.d_model,
+                        args.n_head,
+                        args.n_layers,
+                        args.d_ff,
+                        args.dropout,
+                        args.max_seq_len,
+                        pad_idx,
+                        eos_idx,
+                        sos_idx)
     model.apply(init_weights)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE,
-                            weight_decay=WEIGHT_DECAY)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate,
+                            weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 
+    # Load model if specified
+    if args.load_path:
+        if os.path.exists(args.load_path):
+            model.load_state_dict(torch.load(args.load_path))
+            print(f"Model loaded from {args.load_path}")
+        else:
+            print(f"Warning: Could not find model at {args.load_path}. " +
+                  "Training from scratch.")
+    else:
+        print("Training from scratch")
+
     losses = []
-    for epoch in range(NUM_EPOCHS):
-        loss = train_step(model, optimizer, criterion, src, tgt,
-                          pad_idx, pad_idx, vocab_size)
+    for epoch in range(args.num_epochs):
+        loss = train_step(model, optimizer, criterion, src, tgt, vocab_size)
         losses.append(loss)
 
-        if len(losses) >= SMOOTHING_WINDOW:
-            smoothed_loss = np.mean(losses[-SMOOTHING_WINDOW:])
+        if len(losses) >= args.smoothing_window:
+            smoothed_loss = np.mean(losses[-args.smoothing_window:])
         else:
             smoothed_loss = np.mean(losses)
         scheduler.step(smoothed_loss)
-        print(f"Epoch: {epoch+1}/{NUM_EPOCHS}, Loss: {loss:.4f}, " +
+        print(f"Epoch: {epoch+1}/{args.num_epochs}, Loss: {loss:.4f}, " +
               f"Smoothed Loss: {smoothed_loss:.4f}")
 
-    vocab = build_vocab(tokenize_text(open(args.text_file,
-                                           'r', encoding='utf-8').read()))[0]
-    generated_text = generate_text(model, src[:1], pad_idx, sos_idx, pad_idx,
-                                   vocab, MAX_GEN_LEN, MAX_SEQ_LEN)
+    # Save model
+    torch.save(model.state_dict(), args.save_path)
+    print(f"Model saved at {args.save_path}")
+
+    generated_text = model.generate_text(src[:1],
+                                         vocab,
+                                         args.max_gen_len,
+                                         args.max_seq_len)
     print(f"\nGenerated Text: \n{generated_text}")
 
 
