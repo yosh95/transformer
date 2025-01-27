@@ -5,14 +5,24 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import math
+import argparse
+import os
+import string
 
-D_MODEL = 512
-N_HEAD = 8
-N_LAYERS = 6
-D_FF = 2048
+from collections import Counter
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+
+D_MODEL = 16
+N_HEAD = 4
+N_LAYERS = 2
+D_FF = 16
 DROPOUT = 0.1
 MAX_SEQ_LEN = 100
-VOCAB_SIZE = 1000
+LEARNING_RATE = 0.01
+WEIGHT_DECAY = 0.01
+NUM_EPOCHS = 2000
+SMOOTHING_WINDOW = 10
 
 
 class Embedding(nn.Module):
@@ -202,32 +212,119 @@ class Transformer(nn.Module):
 
 
 def train_step(model, optimizer, criterion, src, tgt,
-               src_pad_idx, tgt_pad_idx):
+               src_pad_idx, tgt_pad_idx, vocab_size):
     optimizer.zero_grad()
     output = model(src, tgt[:, :-1], src_pad_idx, tgt_pad_idx)
-    loss = criterion(output.view(-1, VOCAB_SIZE), tgt[:, 1:].reshape(-1))
+    loss = criterion(output.view(-1, vocab_size), tgt[:, 1:].reshape(-1))
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     return loss.item()
 
 
+def tokenize_text(text):
+    text = text.lower()
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    return text.split()
+
+
+def build_vocab(tokens):
+    token_counts = Counter(tokens)
+    vocab = ["<pad>", "<unk>"] + [token for token,
+                                  count in token_counts.items()]
+    token_to_id = {token: id_ for id_, token in enumerate(vocab)}
+    return vocab, token_to_id
+
+
+def tokens_to_ids(tokens, token_to_id):
+    return [token_to_id.get(token, 1) for token in tokens]
+
+
+def pad_sequence(seq, max_len, pad_idx):
+    seq = seq[:max_len]
+    return seq + [pad_idx] * (max_len - len(seq))
+
+
+def prepare_data(text_file, max_seq_len):
+    with open(text_file, 'r', encoding='utf-8') as file:
+        text = file.read()
+    tokens = tokenize_text(text)
+    vocab, token_to_id = build_vocab(tokens)
+    ids = tokens_to_ids(tokens, token_to_id)
+    pad_idx = 0
+    ids = pad_sequence(ids, max_seq_len, pad_idx)
+
+    src = torch.tensor([ids], dtype=torch.long)
+    tgt = torch.tensor([ids], dtype=torch.long)
+    return src, tgt, pad_idx, len(vocab)
+
+
+def generate_text(model, src, src_pad_idx, vocab, max_seq_len):
+    model.eval()
+    with torch.no_grad():
+        tgt = torch.full((1, 1), src_pad_idx, dtype=torch.long)
+        for i in range(max_seq_len - 1):
+            output = model(src, tgt, src_pad_idx, src_pad_idx)
+            next_token = output[:, -1, :].argmax(dim=-1)
+            tgt = torch.cat([tgt, next_token.unsqueeze(1)], dim=1)
+
+    generated_ids = tgt.squeeze().tolist()
+    generated_tokens = [vocab[id_]
+                        for id_ in generated_ids
+                        if id_ < len(vocab) and id_ != 0]
+    generated_text = ' '.join(generated_tokens)
+    return generated_text
+
+
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Embedding):
+        torch.nn.init.xavier_uniform_(m.weight)
+
+
 def main():
-    src_data = torch.randint(0, VOCAB_SIZE, (64, MAX_SEQ_LEN))
-    tgt_data = torch.randint(0, VOCAB_SIZE, (64, MAX_SEQ_LEN))
-    src_pad_idx = 0
-    tgt_pad_idx = 0
+    parser = argparse.ArgumentParser(
+        description="Train a Transformer model to " +
+                    "generate text from a text file.")
+    parser.add_argument("text_file", type=str,
+                        help="Path to the input text file.")
+    args = parser.parse_args()
 
-    model = Transformer(VOCAB_SIZE, VOCAB_SIZE, D_MODEL, N_HEAD,
+    if not os.path.exists(args.text_file):
+        print(f"Error: The file '{args.text_file}' does not exist.")
+        return
+
+    src, tgt, pad_idx, vocab_size = prepare_data(args.text_file, MAX_SEQ_LEN)
+
+    model = Transformer(vocab_size, vocab_size, D_MODEL, N_HEAD,
                         N_LAYERS, D_FF, DROPOUT, MAX_SEQ_LEN)
+    model.apply(init_weights)
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE,
+                            weight_decay=WEIGHT_DECAY)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    losses = []
+    for epoch in range(NUM_EPOCHS):
+        loss = train_step(model, optimizer, criterion, src, tgt,
+                          pad_idx, pad_idx, vocab_size)
+        losses.append(loss)
 
-    num_epochs = 10
-    for epoch in range(num_epochs):
-        loss = train_step(model, optimizer, criterion, src_data,
-                          tgt_data, src_pad_idx, tgt_pad_idx)
-        print(f"Epoch: {epoch+1}/{num_epochs}, Loss: {loss:.4f}")
+        if len(losses) >= SMOOTHING_WINDOW:
+            smoothed_loss = np.mean(losses[-SMOOTHING_WINDOW:])
+        else:
+            smoothed_loss = np.mean(losses)
+        scheduler.step(smoothed_loss)
+        print(f"Epoch: {epoch+1}/{NUM_EPOCHS}, Loss: {loss:.4f}, " +
+              f"Smoothed Loss: {smoothed_loss:.4f}")
+
+    vocab = build_vocab(tokenize_text(open(args.text_file,
+                                           'r', encoding='utf-8').read()))[0]
+    generated_text = generate_text(model, src, pad_idx, vocab, MAX_SEQ_LEN)
+    print(f"\nGenerated Text: \n{generated_text}")
 
 
 if __name__ == "__main__":
