@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import pdb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,8 +10,8 @@ import argparse
 import os
 import numpy as np
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-import copy
 import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
 
 
 class Embedding(nn.Module):
@@ -24,15 +25,14 @@ class Embedding(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_seq_len):
+    def __init__(self, d_model):
         super(PositionalEncoding, self).__init__()
         self.d_model = d_model
-        self.max_seq_len = max_seq_len
 
     def forward(self, x):
         seq_len = x.size(1)
-        pe = torch.zeros(self.max_seq_len, self.d_model, device=x.device)
-        position = torch.arange(0, self.max_seq_len, dtype=torch.float,
+        pe = torch.zeros(seq_len, self.d_model, device=x.device)
+        position = torch.arange(0, seq_len, dtype=torch.float,
                                 device=x.device).unsqueeze(1)
         div_term = torch.exp(torch.arange(0,
                                           self.d_model,
@@ -69,18 +69,25 @@ class MultiHeadAttention(nn.Module):
     def forward(self, query, key, value, mask=None):
         batch_size = query.size(0)
 
-        q = self.W_q(query).view(batch_size,
-                                 -1, self.n_head, self.d_k).transpose(1, 2)
-        k = self.W_k(key).view(batch_size,
-                               -1, self.n_head, self.d_k).transpose(1, 2)
-        v = self.W_v(value).view(batch_size,
-                                 -1, self.n_head, self.d_k).transpose(1, 2)
+        # Linear transformations
+        q = self.W_q(query)  # (B, N, d_model)
+        k = self.W_k(key)  # (B, N, d_model)
+        v = self.W_v(value)  # (B, N, d_model)
+
+        # Split into heads
+        q = q.view(batch_size, -1, self.n_head,
+                   self.d_k).transpose(1, 2)  # (B, H, N, d_k)
+        k = k.view(batch_size, -1, self.n_head,
+                   self.d_k).transpose(1, 2)  # (B, H, N, d_k)
+        v = v.view(batch_size, -1, self.n_head,
+                   self.d_k).transpose(1, 2)  # (B, H, N, d_k)
 
         attn_output, attn_probs = scaled_dot_product_attention(q, k, v, mask)
+
+        # Concatenate heads and linear transformation
         attn_output = attn_output.transpose(1, 2).contiguous().view(
                 batch_size, -1, self.d_model)
-
-        output = self.W_o(attn_output)
+        output = self.W_o(attn_output)  # (B, N, d_model)
         return output, attn_probs
 
 
@@ -96,207 +103,137 @@ class FeedForwardNetwork(nn.Module):
         return x
 
 
-class EncoderLayer(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(self, d_model, n_head, d_ff, dropout):
-        super(EncoderLayer, self).__init__()
-        self.attn = MultiHeadAttention(d_model, n_head)
+        super(DecoderLayer, self).__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_head)
         self.ffn = FeedForwardNetwork(d_model, d_ff)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask):
-        attn_output, _ = self.attn(x, x, x, mask)
+    def forward(self, x, src_mask, tgt_mask):
+        attn_output, _ = self.self_attn(x, x, x, tgt_mask)
         x = self.norm1(x + self.dropout(attn_output))
         ffn_output = self.ffn(x)
         x = self.norm2(x + self.dropout(ffn_output))
         return x
 
 
-class DecoderLayer(nn.Module):
-    def __init__(self, d_model, n_head, d_ff, dropout):
-        super(DecoderLayer, self).__init__()
-        self.self_attn = MultiHeadAttention(d_model, n_head)
-        self.enc_attn = MultiHeadAttention(d_model, n_head)
-        self.ffn = FeedForwardNetwork(d_model, d_ff)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, enc_output, src_mask, tgt_mask):
-        attn_output, _ = self.self_attn(x, x, x, tgt_mask)
-        x = self.norm1(x + self.dropout(attn_output))
-        enc_attn_output, _ = self.enc_attn(x,
-                                           enc_output,
-                                           enc_output,
-                                           src_mask)
-        x = self.norm2(x + self.dropout(enc_attn_output))
-        ffn_output = self.ffn(x)
-        x = self.norm3(x + self.dropout(ffn_output))
-        return x
-
-
-class Encoder(nn.Module):
-    def __init__(self, input_size, d_model, n_head,
-                 n_layers, d_ff, dropout, max_seq_len):
-        super(Encoder, self).__init__()
-        self.embedding = Embedding(input_size, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
-        self.layers = nn.ModuleList(
-                [EncoderLayer(d_model, n_head, d_ff, dropout)
-                 for _ in range(n_layers)])
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask):
-        x = self.embedding(x)
-        x = self.pos_encoding(x)
-        x = self.dropout(x)
-        for layer in self.layers:
-            x = layer(x, mask)
-        return x
-
-
 class Decoder(nn.Module):
     def __init__(self, output_size, d_model, n_head, n_layers,
-                 d_ff, dropout, max_seq_len):
+                 d_ff, dropout):
         super(Decoder, self).__init__()
         self.embedding = Embedding(1, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
+        self.pos_encoding = PositionalEncoding(d_model)
         self.layers = nn.ModuleList(
                 [DecoderLayer(d_model, n_head, d_ff, dropout)
                  for _ in range(n_layers)])
         self.fc = nn.Linear(d_model, output_size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, enc_output, src_mask, tgt_mask):
+    def forward(self, x, src_mask, tgt_mask):
         x = self.embedding(x)
         x = self.pos_encoding(x)
         x = self.dropout(x)
         for layer in self.layers:
-            x = layer(x, enc_output, src_mask, tgt_mask)
+            x = layer(x, src_mask, tgt_mask)
         x = self.fc(x)
         return x
 
 
-class Transformer(nn.Module):
+class TransformerDecoder(nn.Module):
     def __init__(self,
-                 input_size,
                  output_size,
                  d_model,
                  n_head,
                  n_layers,
                  d_ff,
-                 dropout,
-                 max_seq_len):
-        super(Transformer, self).__init__()
-        self.encoder = Encoder(input_size, d_model, n_head,
-                               n_layers, d_ff, dropout, max_seq_len)
+                 dropout):
+        super(TransformerDecoder, self).__init__()
         self.decoder = Decoder(output_size, d_model, n_head,
-                               n_layers, d_ff, dropout, max_seq_len)
+                               n_layers, d_ff, dropout)
         self.output_size = output_size
-        self.max_seq_len = max_seq_len
+        self.n_head = n_head
+
+    def generate_subsequent_mask(self, tgt):
+        size = tgt.size(1)
+        subsequent_mask = (1 - torch.triu(
+            torch.ones((self.n_head, size, size),
+                       device=tgt.device), diagonal=1)).bool()
+        return subsequent_mask
 
     def generate_mask(self, x):
-        mask = torch.ones(x.size(0), 1, 1, x.size(1), device=x.device).bool()
+        mask = torch.ones(x.size(0),
+                          self.n_head,
+                          x.size(1),
+                          x.size(1),
+                          device=x.device).bool()
         return mask
 
-    def generate_subsequent_mask(self, x):
-        sz = x.size(1)
-        mask = torch.triu(torch.ones(sz, sz, device=x.device),
-                          diagonal=1).bool()
-        return mask
+    def forward(self, tgt):
+        tgt_mask = self.generate_subsequent_mask(tgt)
+        src_mask = self.generate_mask(tgt)
+        output = self.decoder(tgt, src_mask, tgt_mask)
+        return output
 
-    def forward(self, src, tgt):
-        src_mask = self.generate_mask(src)
-        tgt_mask = self.generate_mask(tgt)
-        tgt_mask = tgt_mask & (~self.generate_subsequent_mask(tgt))
+    def generate_data(self, start_sequence, max_gen_len, seq_len):
+        self.eval()
+        generated_sequence = start_sequence.unsqueeze(0)
 
-        enc_output = self.encoder(src, src_mask)
-        output = self.decoder(tgt.unsqueeze(-1),
-                              enc_output,
-                              src_mask,
-                              tgt_mask)
-        return output.squeeze(-1)
-
-    def generate_data(self, src, max_gen_len, max_seq_len, init_val):
-        model = self
-        model.eval()
         with torch.no_grad():
-            enc_output = model.encoder(src, model.generate_mask(src))
+            for _ in range(max_gen_len + 1):
+                tgt = generated_sequence[:, -seq_len:]
+                output = self(tgt)
+                next_val = output[:, -1:]
+                generated_sequence = torch.cat(
+                        (generated_sequence, next_val), dim=1)
 
-            # Initialize target sequence with specified start value
-            tgt = torch.full((src.size(0), 1),
-                             init_val,
-                             dtype=torch.float,
-                             device=src.device)
-            tgt_save = copy.deepcopy(tgt)
-            for i in range(max_gen_len):
-                output = model.decoder(tgt.unsqueeze(-1),
-                                       enc_output,
-                                       model.generate_mask(src),
-                                       model.generate_mask(tgt))
-
-                next_value = output[:, -1, :]
-
-                if tgt.size(1) >= max_seq_len:
-                    tgt = tgt[:, 1:]
-
-                tgt = torch.cat([tgt, next_value], dim=1)
-                tgt_save = torch.cat([tgt_save, next_value], dim=1)
-
-        generated_values = tgt_save.squeeze().tolist()
-        return generated_values
+        return generated_sequence[:, 1:]
 
 
-def train_step(model, optimizer, criterion, src, tgt):
-    optimizer.zero_grad()
-    output = model(src, tgt[:, :-1])
-    loss = criterion(output, tgt[:, 1:])
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
-    return loss.item()
+class SineWaveDataset(Dataset):
+    def __init__(self, seq_len):
+        self.seq_len = seq_len
+        self.src_sequences, self.tgt_sequences = self._prepare_data()
 
+    def _generate_sine_wave(self):
+        time = np.arange(self.seq_len * 10)
+        wave = np.sin(2 * np.pi * time / 10)
+        return np.stack([wave], axis=-1)
 
-def generate_sine_wave(length, period=10, amplitude=1, amplitude_modulator=1):
-    time = np.arange(length)
-    wave = amplitude * np.sin(2 * np.pi * time / period)
-    amplitude_modulator_wave = amplitude_modulator * np.cos(
-            2 * np.pi * time / period)
-    return np.stack([wave, amplitude_modulator_wave], axis=-1)
-
-
-def prepare_data(seq_len, num_data, max_seq_len):
-    """
-    Generates training data for sine wave prediction.
-
-    Args:
-        seq_len (int): The total length of each sine wave.
-        num_data (int): The number of sine waves to generate.
-        max_seq_len (int): The maximum sequence length for the Transformer.
-
-    Returns:
-        tuple: A tuple containing the source (src) and target (tgt) tensors.
-    """
-    src_sequences = []
-    tgt_sequences = []
-    for _ in range(num_data):
-        # Generate sine wave data
-        wave = generate_sine_wave(seq_len + max_seq_len)
-        # Create input and target sequences using sliding window.
-        for i in range(0, seq_len):
-            src_seq = wave[i:i + max_seq_len]
-            tgt_seq = wave[i + 1:i + max_seq_len + 1]
+    def _prepare_data(self):
+        src_sequences = []
+        tgt_sequences = []
+        wave = self._generate_sine_wave()
+        self.wave = wave
+        for i in range(0, wave.size - self.seq_len):
+            src_seq = wave[i:i + self.seq_len]
+            tgt_seq = wave[i + 1:i + self.seq_len + 1, 0:1]
 
             src_sequences.append(src_seq)
             tgt_sequences.append(tgt_seq)
 
-    # Convert lists of numpy arrays to PyTorch tensors
-    src = torch.tensor(src_sequences, dtype=torch.float)
-    tgt = torch.tensor(tgt_sequences, dtype=torch.float)
+        return np.array(src_sequences, dtype=np.float32), \
+            np.array(tgt_sequences, dtype=np.float32)
 
-    return src, tgt
+    def __len__(self):
+        return len(self.src_sequences)
+
+    def __getitem__(self, idx):
+        src = torch.tensor(self.src_sequences[idx], dtype=torch.float)
+        tgt = torch.tensor(self.tgt_sequences[idx], dtype=torch.float)
+        return src, tgt
+
+
+def train_step(model, optimizer, criterion, src, tgt, device):
+    optimizer.zero_grad()
+    output = model(tgt.to(device))
+    loss = criterion(output, tgt.to(device))
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    return loss.item()
 
 
 def init_weights(m):
@@ -311,18 +248,16 @@ def init_weights(m):
 def main():
     parser = argparse.ArgumentParser(
             description="Train a Transformer model to generate a sine wave.")
-    parser.add_argument("--d_model", type=int, default=128,
+    parser.add_argument("--d_model", type=int, default=32,
                         help="Dimension of model.")
     parser.add_argument("--n_head", type=int, default=4,
                         help="Number of heads in attention.")
     parser.add_argument("--n_layers", type=int, default=2,
-                        help="Number of layers in encoder/decoder.")
+                        help="Number of layers in decoder.")
     parser.add_argument("--d_ff", type=int, default=128,
                         help="Dimension of feedforward network.")
     parser.add_argument("--dropout", type=float, default=0.1,
                         help="Dropout rate.")
-    parser.add_argument("--max_seq_len", type=int, default=10,
-                        help="Maximum sequence length.")
     parser.add_argument("--learning_rate", type=float, default=0.001,
                         help="Learning rate.")
     parser.add_argument("--weight_decay", type=float, default=0.01,
@@ -331,34 +266,33 @@ def main():
                         help="Number of training epochs.")
     parser.add_argument("--smoothing_window", type=int, default=10,
                         help="Smoothing window for loss.")
-    parser.add_argument("--max_gen_len", type=int, default=100,
-                        help="Maximum length of generated text.")
     parser.add_argument("--save_path", type=str,
                         default="transformer_model.pt",
                         help="Path for save model.")
     parser.add_argument("--load_path", type=str, default="",
                         help="Path for load model.")
-    parser.add_argument("--seq_len", type=int, default=100,
+    parser.add_argument("--seq_len", type=int, default=10,
                         help="Length of the Sine wave.")
-    parser.add_argument("--num_data", type=int, default=100,
-                        help="Number of generated data")
-    parser.add_argument("--init_val", type=float, default=0,
-                        help="Start value for generation")
-
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size for training.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Gradient accumulation steps")
     args = parser.parse_args()
 
-    src, tgt = prepare_data(args.seq_len, args.num_data, args.max_seq_len)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    model = Transformer(
-        2,
+    dataset = SineWaveDataset(args.seq_len)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    model = TransformerDecoder(
         1,
         args.d_model,
         args.n_head,
         args.n_layers,
         args.d_ff,
         args.dropout,
-        args.max_seq_len,
-    )
+    ).to(device)
     model.apply(init_weights)
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate,
@@ -378,33 +312,44 @@ def main():
 
     losses = []
     for epoch in range(args.num_epochs):
-        loss = train_step(model, optimizer, criterion, src, tgt)
-        losses.append(loss)
+        epoch_loss = 0
+        for batch_idx, (src, tgt) in enumerate(dataloader):
+            loss = train_step(model, optimizer, criterion, src, tgt, device)
+            epoch_loss += loss
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                losses.append(epoch_loss / (batch_idx + 1))
 
         if len(losses) >= args.smoothing_window:
             smoothed_loss = np.mean(losses[-args.smoothing_window:])
         else:
             smoothed_loss = np.mean(losses)
         scheduler.step(smoothed_loss)
-        print(f"Epoch: {epoch+1}/{args.num_epochs}, Loss: {loss:.4f}, " +
+        print(f"Epoch: {epoch+1}/{args.num_epochs}, " +
+              f"Loss: {epoch_loss/(batch_idx+1):.4f}, " +
               f"Smoothed Loss: {smoothed_loss:.4f}")
 
     # Save model
     torch.save(model.state_dict(), args.save_path)
     print(f"Model saved at {args.save_path}")
 
-    generated_data = model.generate_data(src[:1, :, :],
-                                         args.max_gen_len,
-                                         args.max_seq_len,
-                                         args.init_val)
+    # Generate data using the first source sequence
+    first_src, _ = dataset[0]
+    first_src = first_src.to(device)
+
+    generated_data = model.generate_data(first_src,
+                                         dataset.src_sequences.shape[0],
+                                         args.seq_len)
+    generated_data = generated_data.cpu().numpy().squeeze()
 
     # Get the first input sequence from the training data
-    original_wave = src[0].tolist()
+    original_wave = dataset.wave.squeeze(-1)
 
-    time = np.arange(len(original_wave) + len(generated_data) - 1)
-    plt.plot(time[:len(original_wave)], [x[0] for x in original_wave],
+    time = np.arange(len(original_wave))
+    plt.plot(time, original_wave,
              label='Original Sine Wave (input)')
-    plt.plot(time[len(original_wave)-1:], generated_data,
+    plt.plot(time + 1, generated_data,
              label='Predicted Sine Wave')
     plt.xlabel('Time')
     plt.ylabel('Amplitude')
